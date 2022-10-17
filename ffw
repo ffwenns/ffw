@@ -1,0 +1,377 @@
+#/bin/php
+
+<?php require 'kirby/bootstrap.php';
+
+use \Kirby\Cms\App as Kirby;
+use \Kirby\Cms\Site;
+use \Kirby\Cms\Pages;
+use \Kirby\Cms\Page;
+use \Kirby\Toolkit\Str;
+use \Kirby\Toolkit\F;
+use \Kirby\Toolkit\A;
+use \Kirby\Http\Url;
+use \Kirby\Http\Remote;
+use \Kirby\Database\Db;
+
+
+/**
+ * Get long-lived user access token
+ * 
+ * @see https://developers.facebook.com/docs/pages/access-tokens#get-a-long-lived-user-access-token
+ */
+function _get_user_access_token($fb_exchange_token) {
+
+    $app_id = getenv('FFWENNS_APP_ID');
+    $app_secret = getenv('FFWENNS_APP_SECRET');
+
+    $response = Remote::get('https://graph.facebook.com/oauth/access_token', [
+        'data' => [
+            'grant_type' => 'fb_exchange_token',
+            'client_id' => $app_id,
+            'client_secret' => $app_secret,
+            'fb_exchange_token' => $fb_exchange_token
+        ]
+    ]);
+        
+    $user = $response->json();
+
+    if(!A::get($user, 'access_token')) {
+        var_dump($user);
+        exit();
+    }
+
+    return $user['access_token'];
+
+}
+
+/**
+ * Get page access token (without expiration date)
+ * 
+ * @see https://developers.facebook.com/docs/pages/access-tokens#get-a-page-access-token
+ */
+function _get_page_access_token() {
+
+    if(F::exists('.fbauth')) {
+        return F::read('.fbauth');
+    }
+
+    $fb_exchange_token = getenv('FFWENNS_FB_EXCHANGE_TOKEN');
+    $user_access_token = _get_user_access_token($fb_exchange_token);
+
+    $response = Remote::get('https://graph.facebook.com/ffwenns', [
+        'data' => [
+            'fields' => 'access_token',
+            'access_token' => $user_access_token
+        ]
+    ]);
+
+    $page = $response->json();
+
+    if(!A::get($page, 'access_token')) {
+        var_dump($page);
+        exit();
+    }
+
+    F::write('.fbauth', $page['access_token']);
+
+    return $page['access_token'];
+
+}
+
+function _get_slug($post) {
+
+    return Str::split($post['id'], '_')[1];
+
+}
+
+function _get_date($post) {
+
+    $timestamp = strtotime($post['created_time']);
+    return date('Y-m-d', $timestamp);
+
+}
+
+function _get_title($post) {
+
+    $pattern_dashes = '/---.*(.*).*---/m';
+    $pattern_emojis = '/^\s*(?:[[:^print:]]{6}).{10,200}(?:[[:^print:]]{6})/m';
+
+    // try to parse title from post message
+    if(preg_match($pattern_dashes, $post['message'], $matches_dashes)) {
+        return $matches_dashes[0];
+    } 
+    
+    if(preg_match($pattern_emojis, $post['message'], $matches_emojis)) {
+        return $matches_emojis[0];
+    }
+
+}
+
+function _get_text($post, $title) {
+
+    if($title) {
+        return Str::split($post['message'], $title)[0];
+    } 
+
+    return $post['message'];
+        
+}
+
+function _sanitize_content($text) {
+
+    if(!$text) {
+        return null;
+    }
+
+    // remove emoji
+    $text = utf8_encode(iconv("UTF-8", "ISO-8859-1//IGNORE", $text)); 
+
+    $text = Str::replace($text, '---', '');
+    $text = Str::trim($text);
+
+    return $text;
+
+}
+
+function _get_category($post, $title) {
+
+    if(!$title) {
+        return '';
+    }
+
+    if(!array_key_exists('message_tags', $post)) {
+        return '';
+    }
+
+    $categories = array_column($post['message_tags'], 'name');
+    $categories = array_map('strtolower', $categories);
+
+    if(in_array('#einsätze', $categories)) {
+        return 'Einsätze';
+    }
+
+    if(in_array('#übungen', $categories)) {
+        return 'Übungen';
+    }
+
+    if(in_array('#tätigkeiten', $categories)) {
+        return 'Tätigkeiten';
+    }
+
+    return '';
+
+}
+
+function _get_page($post, $pages) {
+
+    $slug = _get_slug($post);
+    $date = _get_date($post);
+    $title = _get_title($post);
+    $text = _get_text($post, $title);
+    $category = _get_category($post, $title);
+
+    // if post already exists
+    $parent = $pages->find('aktuelles');
+    $page = $parent->childrenAndDrafts()->find($slug);
+
+    // ...or has no category
+    if($page || !$category) {
+        return null;
+    }
+
+    // remove hashtags
+    $text = preg_replace('/#\S{1,}/', '', $text);
+
+    $page = Page::create([
+        'parent' => $parent,
+        'slug' => $slug,
+        'template' => 'post',
+        'content' => [
+            'title' => _sanitize_content($title) ?? '-',
+            'date' => $date,
+            'text' => _sanitize_content($text),
+            'category' => $category,
+            'source' => 'facebook',
+            'sid' => $slug,
+        ]
+    ]);
+
+    $page = $page->publish();
+
+    return $page;
+
+}
+
+function _get_attachments($post) {
+
+    $attachments = $post['attachments']['data'] ?? [];
+    $targets = [];
+
+    foreach($attachments as $att) {
+        $target = $att['target'] ?? null;
+        $type = $att['type'] ?? null;
+
+        if($type == 'photo' && Str::contains($target['url'], 'ffwenns')) {
+            $targets[] = [
+                'method' => 'GET',
+                'relative_url' => $target['id'] . '?fields=images'
+            ];
+
+            continue;
+        }
+
+        if($type != 'album') continue;
+
+        $subattachments = $att['subattachments']['data'] ?? [];
+
+        foreach($subattachments as $subatt) {
+            if($subatt['type'] == 'photo') {
+                $targets[] = [
+                    'method' => 'GET',
+                    'relative_url' => $subatt['target']['id'] . '?fields=images'
+                ];
+            }
+        }
+    }
+
+    return $targets;
+
+}
+
+function _download_attachments($attachments, $page) {
+
+    $response = Remote::request('https://graph.facebook.com/ffwenns', [
+        'method' => 'POST',
+        'data' => [
+            'batch' => json_encode($attachments),
+            'include_headers' => 'false',
+            'access_token' => _get_page_access_token()
+        ]
+    ]);
+
+    $data = $response->json();
+
+    foreach($data as $item) {
+        if($item['code'] == 200) {
+            $body = json_decode($item['body']);
+            $image = $body->images[0];
+            $filename = Str::split(F::filename($image->source), '?')[0];
+
+            $src = $image->source;
+            $dest = './content/' . $page->diruri() . '/' . $filename;
+
+            if(!F::exists($dest)) {
+                $data = file_get_contents($src);
+                file_put_contents($dest, $data);
+            }
+        }
+    }
+
+}
+
+function _get_facebook_posts($url = 'https://graph.facebook.com/ffwenns/posts') {
+
+    $response = Remote::get($url, [
+        'data' => [
+            'access_token' => _get_page_access_token(),
+            'fields' => 'id,created_time,message,message_tags,attachments{target,type,subattachments}',
+            // 'limit' => 100
+        ]
+    ]);
+
+    return $response->json();
+
+}
+
+
+function import_facebook($kirby, $site, $pages) {
+
+    $posts = _get_facebook_posts()['data'];
+
+    foreach($posts as $post) {
+        // if post has no message
+        if(!A::get($post, 'message')) continue;
+
+        $page = _get_page($post, $pages);
+        if(!$page) continue;
+
+        $attachments = _get_attachments($post);
+
+        // if post has attachments
+        if(!empty($attachments)) {
+            _download_attachments($attachments, $page);
+
+            // set banner
+            $update = $page->update([
+                'banner' => $page->images()->first()->filename()
+            ]);
+        };
+    }
+
+}
+
+function import_wordpress($kirby, $site, $pages) {
+
+    $sql = "SELECT id, post_date, post_title, post_name, post_type,
+       MAX(CASE WHEN meta_key='text' THEN meta_value END) AS post_text,
+       MAX(CASE WHEN meta_key='bilder' THEN meta_value END) AS attachments
+    FROM wp_posts INNER JOIN wp_postmeta ON post_id=id
+    WHERE post_type IN ('einsaetze', 'uebungen', 'taetigkeiten') AND
+          post_status='publish' GROUP BY id ORDER BY post_date DESC";
+
+    $posts = Db::query($sql);
+    $parent = $pages->find('aktuelles');
+    $cats = ['einsaetze', 'uebungen', 'taetigkeiten'];
+    $dogs = ['Einsätze', 'Übungen', 'Tätigkeiten'];
+
+    $posts->map(function($post) use ($parent, $cats, $dogs) {
+        $category = Str::replace($post->post_type, $cats, $dogs);
+        $slug = $post->id();
+
+        // if post already exists
+        if($parent->childrenAndDrafts()->find($slug)) return;
+
+        $page = Page::create([
+            'parent' => $parent,
+            'slug' => $slug,
+            'template' => 'post',
+            'content' => [
+                'title' => $post->post_title(),
+                'date' => $post->post_date(),
+                'text' => $post->post_text(),
+                'category' => $category,
+                'source' => 'wordpress',
+                'sid' => $post->id(),
+            ]
+        ]);
+
+        // if post has no attachments
+        if(!$post->attachments()) return;
+
+        $atts = implode(', ', unserialize($post->attachments()));
+        $attachments = DB::query("SELECT guid FROM wp_posts WHERE id in ($atts)");
+
+        foreach($attachments as $attachment) {
+            $src = './data/wordpress/' . URL::path($attachment->guid());
+            $dest = './content/' . $page->diruri() . '/' . F::filename($attachment->guid());
+
+            F::copy($src, $dest);
+        }
+    });
+}
+
+$kirby = new Kirby();
+$kirby->impersonate('kirby');
+$site = $kirby->site();
+$pages = $site->pages();
+
+$command = $argv[1] ?? null;
+$subcommand = $argv[2] ?? null;
+
+if(isset($command) && function_exists($command)) {
+    call_user_func($command, $kirby, $site, $pages);
+}
+
+if(isset($subcommand) && function_exists($command . "_" . $subcommand)) {
+    call_user_func($command . "_" . $subcommand, $kirby, $site, $pages);
+}
